@@ -81,12 +81,42 @@ class TempleRepository:
             (temple_id, digest),
         ).fetchone()
 
-    def effective_safety_policy(self, temple_id: int, now: str) -> sqlite3.Row | None:
+    def effective_safety_policy(self, temple_id: int, at: str) -> sqlite3.Row | None:
+        # 仅依据 [effective_from, effective_to) 半开区间定位：
+        # 已退役的旧版本仍能按其历史区间被查到，当前版本（effective_to 为空）覆盖之后所有时刻。
+        # 时间轴不变量保证任意时刻至多一条匹配，草稿（effective_from 为空）不会命中。
         return self.connection.execute(
-            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='published' AND effective_from<=? "
+            "SELECT * FROM safety_policy_versions WHERE temple_id=? "
+            "AND effective_from IS NOT NULL AND effective_from<=? "
+            "AND (effective_to IS NULL OR effective_to>?) "
             "ORDER BY effective_from DESC,version_no DESC LIMIT 1",
-            (temple_id, now),
+            (temple_id, at, at),
         ).fetchone()
+
+    def published_safety_policy_at(self, temple_id: int, effective_from: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='published' AND effective_from=?",
+            (temple_id, effective_from),
+        ).fetchone()
+
+    def published_safety_policy_froms(self, temple_id: int) -> list[str]:
+        rows = self.connection.execute(
+            "SELECT effective_from FROM safety_policy_versions WHERE temple_id=? AND state='published' ORDER BY effective_from",
+            (temple_id,),
+        ).fetchall()
+        return [row[0] for row in rows]
+
+    def relink_safety_policy_timeline(self, temple_id: int) -> None:
+        rows = self.connection.execute(
+            "SELECT id,effective_from FROM safety_policy_versions WHERE temple_id=? AND state='published' ORDER BY effective_from,version_no",
+            (temple_id,),
+        ).fetchall()
+        for index, row in enumerate(rows):
+            effective_to = rows[index + 1]["effective_from"] if index + 1 < len(rows) else None
+            self.connection.execute(
+                "UPDATE safety_policy_versions SET effective_to=? WHERE id=?",
+                (effective_to, row["id"]),
+            )
 
     def policies(self, temple_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(

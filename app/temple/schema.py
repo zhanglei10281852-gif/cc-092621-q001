@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS safety_policy_versions (
     created_by TEXT NOT NULL,
     published_by TEXT,
     effective_from TEXT,
+    effective_to TEXT,
     retired_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS safety_policy_versions (
     UNIQUE(temple_id, rules_digest)
 );
 CREATE INDEX IF NOT EXISTS idx_safety_policy_effective ON safety_policy_versions(temple_id,state,effective_from);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_safety_policy_schedule ON safety_policy_versions(temple_id,effective_from) WHERE state='published';
 CREATE TABLE IF NOT EXISTS incense_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     observation_key TEXT NOT NULL UNIQUE,
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS safety_incidents (
     incense_profile_id INTEGER NOT NULL REFERENCES incense_profiles(id),
     severity TEXT NOT NULL CHECK(severity IN ('minor','major','critical')),
     reasons_json TEXT NOT NULL,
+    safety_policy_version_id INTEGER REFERENCES safety_policy_versions(id),
     state TEXT NOT NULL DEFAULT 'open' CHECK(state IN ('open','mitigating','resolved','expired')),
     opened_at TEXT NOT NULL,
     resolved_at TEXT,
@@ -204,3 +207,40 @@ CREATE INDEX IF NOT EXISTS idx_restoration_events_resource ON restoration_events
 
 def ensure_temple_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(TEMPLE_SCHEMA)
+    _migrate_policy_timeline(connection)
+
+
+def _migrate_policy_timeline(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(safety_policy_versions)")}
+    if "effective_to" not in columns:
+        connection.execute("ALTER TABLE safety_policy_versions ADD COLUMN effective_to TEXT")
+    incident_columns = {row[1] for row in connection.execute("PRAGMA table_info(safety_incidents)")}
+    if "safety_policy_version_id" not in incident_columns:
+        connection.execute("ALTER TABLE safety_incidents ADD COLUMN safety_policy_version_id INTEGER REFERENCES safety_policy_versions(id)")
+    # 旧数据：凡是曾经发布过的版本（effective_from 非空，含被旧实现提前退役的版本）
+    # 按生效时点串成 [effective_from, 下一版生效时点) 的半开区间，最后一版结束边界留空。
+    rows = connection.execute(
+        "SELECT id,temple_id,effective_from,effective_to FROM safety_policy_versions "
+        "WHERE effective_from IS NOT NULL ORDER BY temple_id,effective_from,version_no"
+    ).fetchall()
+    for index, row in enumerate(rows):
+        if row["effective_to"] is not None:
+            continue
+        later = next((item for item in rows[index + 1:] if item["temple_id"] == row["temple_id"]), None)
+        effective_to = later["effective_from"] if later else None
+        connection.execute("UPDATE safety_policy_versions SET effective_to=? WHERE id=?", (effective_to, row["id"]))
+    # 历史脏数据恢复：被旧实现提前退役、但其区间非空且后继版本恰好落在结束边界上的版本，
+    # 恢复为已发布并以 effective_to 作为可审计的结束边界（retired_at 保留原始记录）。
+    # 同一生效时点被顶替的空区间版本（effective_to = effective_from）保持退役，
+    # 因而不会与同点版本冲突。
+    connection.execute(
+        "UPDATE safety_policy_versions SET state='published' "
+        "WHERE state='retired' AND effective_to IS NOT NULL AND effective_to>effective_from "
+        "AND EXISTS (SELECT 1 FROM safety_policy_versions AS later "
+        "WHERE later.temple_id=safety_policy_versions.temple_id "
+        "AND later.effective_from=safety_policy_versions.effective_to)"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_safety_policy_schedule "
+        "ON safety_policy_versions(temple_id,effective_from) WHERE state='published'"
+    )

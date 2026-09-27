@@ -61,7 +61,7 @@ def command_temple_demo() -> int:
                 "temple_code": "lingyun-temple",
                 "authorization_code": "festival-duty",
                 "valid_from": "2026-09-26T00:00:00Z",
-                "valid_until": "2026-09-27T00:00:00Z",
+                "valid_until": "2030-09-27T00:00:00Z",
                 "source_approval_id": "demo-approval-000001",
             },
         )

@@ -49,6 +49,21 @@ def publish_safety_policy(safety_policy_id: int, payload: SafetyPolicyPublish):
     return service().publish_safety_policy(safety_policy_id, payload.actor, payload.effective_from)
 
 
+@router.get("/temples/{temple_code}/policies")
+def list_safety_policies(temple_code: str):
+    return {"items": service().list_safety_policies(temple_code)}
+
+
+@router.get("/policies/effective")
+def effective_safety_policy(temple_code: str, at: str | None = None):
+    return service().effective_safety_policy(temple_code, at)
+
+
+@router.post("/policies/retire-due")
+def retire_due_safety_policies(actor: str = Query(default="policy-timeline-sweeper", min_length=1)):
+    return service().retire_due_safety_policies(actor)
+
+
 @router.post("/authorizations", status_code=201)
 def add_authorization(payload: AuthorizationCreate):
     return service().add_authorization(payload.model_dump())

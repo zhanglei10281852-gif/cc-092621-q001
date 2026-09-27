@@ -112,7 +112,7 @@ def test_mitigation_requires_authorization_and_releases_ventilation(client):
             "temple_code": "lingyun-temple",
             "authorization_code": "festival-duty",
             "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            "valid_until": "2030-09-27T00:00:00Z",
             "source_approval_id": "order-000001",
         },
     )
@@ -141,7 +141,7 @@ def test_expired_mitigation_session_reopens_safety_incident_with_fixed_clock(cli
             "temple_code": "lingyun-temple",
             "authorization_code": "festival-duty",
             "valid_from": "2026-09-26T00:00:00Z",
-            "valid_until": "2026-09-27T00:00:00Z",
+            "valid_until": "2030-09-27T00:00:00Z",
             "source_approval_id": "order-000002",
         },
     )
@@ -172,7 +172,7 @@ def test_ventilation_limit_rejects_second_mitigation_session(client):
                 "temple_code": "lingyun-temple",
                 "authorization_code": "festival-duty",
                 "valid_from": "2026-09-26T00:00:00Z",
-                "valid_until": "2026-09-27T00:00:00Z",
+                "valid_until": "2030-09-27T00:00:00Z",
                 "source_approval_id": f"order-ventilation-{index:03d}",
             },
         )
@@ -186,16 +186,32 @@ def test_ventilation_limit_rejects_second_mitigation_session(client):
 
 def test_safety_policy_versions_replace_previous_publication(client):
     prepared = prepare(client)
+    old_id = prepared["safety_policy"]["id"]
     changed = {**DEFAULT_RULES, "allocation": {**DEFAULT_RULES["allocation"], "duration_seconds": 240}}
     draft = client.post("/api/temple/temples/lingyun-temple/policies", json={"rules": changed, "actor": "tests"})
     assert draft.status_code == 201
     publish = client.post(
         f"/api/temple/policies/{draft.json()['id']}/publish",
-        json={"actor": "tests", "effective_from": "2026-09-26T01:00:00Z"},
+        json={"actor": "tests", "effective_from": "2026-10-01T00:00:00Z"},
     )
     assert publish.status_code == 200
-    old = get_connection().execute("SELECT state FROM safety_policy_versions WHERE id=?", (prepared["safety_policy"]["id"],)).fetchone()
-    assert old["state"] == "retired"
+    connection = get_connection()
+    old = connection.execute("SELECT state,effective_from,effective_to FROM safety_policy_versions WHERE id=?", (old_id,)).fetchone()
+    new = connection.execute("SELECT state,effective_from,effective_to FROM safety_policy_versions WHERE id=?", (draft.json()["id"],)).fetchone()
+    # 预约登记不改变此刻的有效版本：旧版仍发布，但结束边界闭合到新版生效时点。
+    assert old["state"] == "published"
+    assert old["effective_to"] == "2026-10-01T00:00:00+00:00"
+    assert new["state"] == "published"
+    assert new["effective_to"] is None
+    # 到达约定时点后，旧版退役、新版生效，区间首尾相接。
+    service = TempleSafetyService(connection, FrozenClock(datetime(2026, 10, 1, 0, 0, tzinfo=UTC)))
+    assert service.retire_due_safety_policies("tests")["retired"] == [old_id]
+    assert connection.execute("SELECT state FROM safety_policy_versions WHERE id=?", (old_id,)).fetchone()["state"] == "retired"
+    current = service.effective_safety_policy("lingyun-temple")
+    assert current["id"] == draft.json()["id"]
+    # 切换前任意时刻仍可审计地查到旧版。
+    before = service.effective_safety_policy("lingyun-temple", "2026-09-30T23:59:59Z")
+    assert before["id"] == old_id
 
 
 def test_demo_seed_and_summary(client):
