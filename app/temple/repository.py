@@ -81,12 +81,42 @@ class TempleRepository:
             (temple_id, digest),
         ).fetchone()
 
-    def effective_safety_policy(self, temple_id: int, now: str) -> sqlite3.Row | None:
+    def active_safety_policy(self, temple_id: int) -> sqlite3.Row | None:
+        """当前时刻已生效、尚未被后继版本替换的唯一版本。"""
         return self.connection.execute(
-            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='published' AND effective_from<=? "
-            "ORDER BY effective_from DESC,version_no DESC LIMIT 1",
-            (temple_id, now),
+            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='published'",
+            (temple_id,),
         ).fetchone()
+
+    def scheduled_safety_policy_at(self, temple_id: int, effective_from: str) -> sqlite3.Row | None:
+        return self.connection.execute(
+            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='scheduled' AND effective_from=?",
+            (temple_id, effective_from),
+        ).fetchone()
+
+    def safety_policy_as_of(self, temple_id: int, moment: str) -> sqlite3.Row | None:
+        """业务时间 moment 时刻的有效版本。
+
+        生效区间为 [effective_from, retired_at)：published 版本在其预约时点
+        生效、且没有结束边界；retired 版本在其预约时点生效、在后继版本的预约
+        时点结束；scheduled 版本对其预约时点之后的业务时间同样可见（尚未激活
+        不影响按业务时间选版）。任意时刻至多命中一个版本，切换时点本身归新版
+        本所有；现实世界动作（如发起处置）只能用 active_safety_policy。
+        """
+        return self.connection.execute(
+            "SELECT * FROM safety_policy_versions "
+            "WHERE temple_id=? AND state IN ('published','retired','scheduled') "
+            "AND effective_from<=? AND (retired_at IS NULL OR retired_at>?) "
+            "ORDER BY effective_from DESC,version_no DESC LIMIT 1",
+            (temple_id, moment, moment),
+        ).fetchone()
+
+    def due_safety_policies(self, now: str) -> list[sqlite3.Row]:
+        """到达生效时点、需要从 scheduled 激活的预约版本。"""
+        return self.connection.execute(
+            "SELECT * FROM safety_policy_versions WHERE state='scheduled' AND effective_from<=? ORDER BY effective_from,id",
+            (now,),
+        ).fetchall()
 
     def policies(self, temple_id: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(

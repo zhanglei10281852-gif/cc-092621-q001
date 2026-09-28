@@ -44,9 +44,19 @@ def create_safety_policy(temple_code: str, payload: SafetyPolicyCreate):
     return service().create_safety_policy(temple_code, payload.rules, payload.actor)
 
 
+@router.get("/temples/{temple_code}/policies")
+def list_safety_policies(temple_code: str):
+    return {"items": service().safety_policies(temple_code)}
+
+
 @router.post("/policies/{safety_policy_id}/publish")
 def publish_safety_policy(safety_policy_id: int, payload: SafetyPolicyPublish):
     return service().publish_safety_policy(safety_policy_id, payload.actor, payload.effective_from)
+
+
+@router.post("/policies/activate-due")
+def activate_due_safety_policies():
+    return service().activate_due_safety_policies()
 
 
 @router.post("/authorizations", status_code=201)

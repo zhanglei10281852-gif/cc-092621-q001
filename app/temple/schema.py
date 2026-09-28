@@ -2,6 +2,36 @@ from __future__ import annotations
 
 import sqlite3
 
+from app.core.clock import to_storage, utc_now
+
+SAFETY_POLICY_TABLE_DDL = r'''
+CREATE TABLE IF NOT EXISTS safety_policy_versions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    temple_id INTEGER NOT NULL REFERENCES temple_sites(id) ON DELETE CASCADE,
+    version_no INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','scheduled','published','retired')),
+    rules_json TEXT NOT NULL,
+    rules_digest TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    published_by TEXT,
+    effective_from TEXT,
+    retired_at TEXT,
+    retired_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(temple_id, version_no),
+    UNIQUE(temple_id, rules_digest)
+);
+'''
+
+SAFETY_POLICY_INDEX_DDL = r'''
+-- 同一寺院至多一个当前有效版本；同一预约时点至多一个预约版本（不同时点可串成
+-- 预约链）；退役版本永久保留作为可审计的结束边界。draft 版本被 WHERE 排除。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_safety_policy_active ON safety_policy_versions(temple_id) WHERE state='published';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_safety_policy_scheduled ON safety_policy_versions(temple_id,effective_from) WHERE state='scheduled';
+CREATE INDEX IF NOT EXISTS idx_safety_policy_effective ON safety_policy_versions(temple_id,state,effective_from);
+'''
+
 TEMPLE_SCHEMA = r'''
 CREATE TABLE IF NOT EXISTS temple_sites (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,23 +73,7 @@ CREATE TABLE IF NOT EXISTS incense_profiles (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS safety_policy_versions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    temple_id INTEGER NOT NULL REFERENCES temple_sites(id) ON DELETE CASCADE,
-    version_no INTEGER NOT NULL,
-    state TEXT NOT NULL DEFAULT 'draft' CHECK(state IN ('draft','published','retired')),
-    rules_json TEXT NOT NULL,
-    rules_digest TEXT NOT NULL,
-    created_by TEXT NOT NULL,
-    published_by TEXT,
-    effective_from TEXT,
-    retired_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE(temple_id, version_no),
-    UNIQUE(temple_id, rules_digest)
-);
-CREATE INDEX IF NOT EXISTS idx_safety_policy_effective ON safety_policy_versions(temple_id,state,effective_from);
+''' + SAFETY_POLICY_TABLE_DDL + r'''
 CREATE TABLE IF NOT EXISTS incense_observations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     observation_key TEXT NOT NULL UNIQUE,
@@ -75,7 +89,8 @@ CREATE TABLE IF NOT EXISTS incense_observations (
     exhaust_airflow REAL NOT NULL CHECK(exhaust_airflow >= 0),
     observed_at TEXT NOT NULL,
     received_at TEXT NOT NULL,
-    payload_digest TEXT NOT NULL
+    payload_digest TEXT NOT NULL,
+    safety_policy_version_id INTEGER REFERENCES safety_policy_versions(id)
 );
 CREATE INDEX IF NOT EXISTS idx_observations_scene_time ON incense_observations(temple_id,observed_at);
 CREATE TABLE IF NOT EXISTS safety_incidents (
@@ -204,3 +219,90 @@ CREATE INDEX IF NOT EXISTS idx_restoration_events_resource ON restoration_events
 
 def ensure_temple_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(TEMPLE_SCHEMA)
+    _ensure_safety_policy_table(connection)
+    connection.executescript(SAFETY_POLICY_INDEX_DDL)
+    _ensure_observation_policy_column(connection)
+
+
+def _ensure_observation_policy_column(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(incense_observations)")}
+    if "safety_policy_version_id" not in columns:
+        connection.execute(
+            "ALTER TABLE incense_observations ADD COLUMN safety_policy_version_id INTEGER REFERENCES safety_policy_versions(id)"
+        )
+
+
+def _ensure_safety_policy_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(SAFETY_POLICY_TABLE_DDL)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(safety_policy_versions)")}
+    if "retired_reason" in columns:
+        return
+    # 旧版本表缺少 scheduled 状态（受 CHECK 约束限制）与 retired_reason 列，
+    # SQLite 无法直接修改约束，按外键依赖顺序重建。
+    cutover = to_storage(utc_now())
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            "ALTER TABLE safety_policy_versions RENAME TO safety_policy_versions_legacy;\n"
+            + SAFETY_POLICY_TABLE_DDL
+        )
+        # 旧实现没有 scheduled：未来才生效却已 published 的行要还原为预约；
+        # 已退役行补 retired_reason='superseded'。
+        connection.execute(
+            """
+            INSERT INTO safety_policy_versions(
+                id,temple_id,version_no,state,rules_json,rules_digest,created_by,published_by,
+                effective_from,retired_at,retired_reason,created_at,updated_at
+            )
+            SELECT id,temple_id,version_no,
+                   CASE WHEN state='published' AND effective_from>:cutover THEN 'scheduled' ELSE state END,
+                   rules_json,rules_digest,created_by,published_by,
+                   effective_from,retired_at,
+                   CASE WHEN state='retired' THEN 'superseded' ELSE '' END,
+                   created_at,updated_at
+            FROM safety_policy_versions_legacy
+            """,
+            {"cutover": cutover},
+        )
+        connection.execute("DROP TABLE safety_policy_versions_legacy")
+        # 旧数据若在同一预约时点残留多个 published 行，只保留 id 最大的一个为
+        # scheduled，其余退回 draft，使 (temple_id,effective_from) 偏序唯一索引
+        # 能够建立。
+        connection.execute(
+            """
+            UPDATE safety_policy_versions SET state='draft', published_by=NULL, effective_from=NULL
+            WHERE state='scheduled' AND id NOT IN (
+                SELECT MAX(id) FROM safety_policy_versions WHERE state='scheduled'
+                GROUP BY temple_id,effective_from
+            )
+            """
+        )
+        # 旧数据若残留多个已到点的 published 行（旧表没有唯一约束），每寺院只保留
+        # 生效时点最新的一个，其余转为退役，使偏序唯一索引能够建立。
+        connection.execute(
+            """
+            UPDATE safety_policy_versions SET state='retired', retired_reason='superseded'
+            WHERE state='published' AND effective_from<=:cutover AND id NOT IN (
+                SELECT winner_id FROM (
+                    SELECT (SELECT p2.id FROM safety_policy_versions p2
+                            WHERE p2.temple_id=p.temple_id AND p2.state='published'
+                            ORDER BY p2.effective_from DESC,p2.id DESC LIMIT 1) AS winner_id
+                    FROM safety_policy_versions p
+                    WHERE p.state='published' AND p.effective_from<=:cutover
+                    GROUP BY p.temple_id
+                )
+            )
+            """,
+            {"cutover": cutover},
+        )
+        # 旧实现把 retired_at 记为发布操作时间，可能早于后继版本的生效时点而留下
+        # 空档；统一用时间线上下一版本的生效时点重写结束边界。
+        connection.execute(
+            "UPDATE safety_policy_versions SET retired_at=("
+            "SELECT MIN(n.effective_from) FROM safety_policy_versions n "
+            "WHERE n.temple_id=safety_policy_versions.temple_id "
+            "AND n.effective_from>safety_policy_versions.effective_from) "
+            "WHERE state='retired'"
+        )
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")

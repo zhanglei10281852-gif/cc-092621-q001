@@ -81,6 +81,14 @@ class TempleSafetyService:
             return TempleRepository._safety_policy(repository.safety_policy_by_id(cursor.lastrowid))
 
     def publish_safety_policy(self, safety_policy_id: int, actor: str, effective_from: str) -> dict[str, Any]:
+        """登记策略版本的预约生效时间。
+
+        发布只登记预约，不改变此刻的有效版本：effective_from 在未来的版本进入
+        scheduled，现行版本继续 published；effective_from 已到（含回溯登记）则
+        立即激活。到达预约时点由 activate_due_safety_policies 完成切换：新版本
+        published，旧版本 retired 并把 retired_at 记为新版本的生效时点，留下
+        [effective_from, retired_at) 形式的可审计结束边界。
+        """
         safety_policy = self.repository.safety_policy_by_id(safety_policy_id)
         if safety_policy is None:
             raise NotFoundError("策略版本不存在")
@@ -92,15 +100,98 @@ class TempleSafetyService:
             raise ValidationError("生效时间格式不正确") from exc
         now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
-            connection.execute(
-                "UPDATE safety_policy_versions SET state='retired',retired_at=?,updated_at=? WHERE temple_id=? AND state='published' AND id<>?",
-                (now, now, safety_policy["temple_id"], safety_policy_id),
-            )
-            connection.execute(
-                "UPDATE safety_policy_versions SET state='published',published_by=?,effective_from=?,retired_at=NULL,updated_at=? WHERE id=?",
-                (actor, effective, now, safety_policy_id),
-            )
+            repository = TempleRepository(connection)
+            target = repository.safety_policy_by_id(safety_policy_id)
+            if target["state"] in ("scheduled", "published"):
+                if target["effective_from"] == effective:
+                    # 重复提交：预约已登记，幂等返回既有版本，不改时间线。
+                    return TempleRepository._safety_policy(target)
+                raise ConflictError("已登记或已生效的策略版本不能更改生效时间")
+            if scheduled_at := repository.scheduled_safety_policy_at(safety_policy["temple_id"], effective):
+                raise ConflictError("该生效时点已有预约中的策略版本")
+            if effective <= now:
+                active = repository.active_safety_policy(safety_policy["temple_id"])
+                if active is not None and effective <= active["effective_from"]:
+                    raise ConflictError("生效时间不能早于或等于当前有效版本的生效时间，不能向时间线内插入版本")
+                # 立即生效（含回溯登记）：把所有已到点的预约版本与本版本按生效
+                # 时点先后顺序依次激活，避免与漏跑的预约链产生倒挂区间。
+                self._activate_chain(connection, safety_policy["temple_id"], safety_policy_id, effective, now, actor)
+            else:
+                try:
+                    connection.execute(
+                        "UPDATE safety_policy_versions SET state='scheduled',published_by=?,effective_from=?,"
+                        "retired_at=NULL,retired_reason='',updated_at=? WHERE id=?",
+                        (actor, effective, now, safety_policy_id),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    # 两名主管并发登记同一生效时点：唯一索引保证只有一个成功。
+                    raise ConflictError("该生效时点已有预约中的策略版本") from exc
             return TempleRepository._safety_policy(TempleRepository(connection).safety_policy_by_id(safety_policy_id))
+
+    def activate_due_safety_policies(self) -> dict[str, Any]:
+        """激活所有到达预约时点的版本，并关闭上一版本的生效区间。
+
+        在单个写事务内按生效时点顺序切换，预约链要么整体完成切换、要么全部
+        不变，任何时刻都不会出现两个重叠版本或没有可用版本的空档。
+        """
+        now = to_storage(self.clock.now())
+        with transaction(immediate=True) as connection:
+            repository = TempleRepository(connection)
+            due = repository.due_safety_policies(now)
+            for target in due:
+                self._activate_policy(connection, target)
+            return {"activated": [row["id"] for row in due]}
+
+    def safety_policies(self, temple_code: str) -> list[dict[str, Any]]:
+        # 读取历史前先让到点的预约落账，使状态与业务时间一致。
+        self.activate_due_safety_policies()
+        return self.repository.policies(self._temple(temple_code)["id"])
+
+    def _activate_chain(
+        self,
+        connection: sqlite3.Connection,
+        temple_id: int,
+        target_id: int,
+        target_effective: str,
+        now: str,
+        actor: str,
+    ) -> None:
+        """立即发布 target 时，连同漏跑的预约链按生效时点顺序依次激活。"""
+        connection.execute(
+            "UPDATE safety_policy_versions SET state='scheduled',published_by=?,effective_from=?,retired_at=NULL,"
+            "retired_reason='',updated_at=? WHERE id=?",
+            (actor, target_effective, now, target_id),
+        )
+        self._activate_due_locked(connection, now, temple_id)
+
+    @staticmethod
+    def _activate_due_locked(connection: sqlite3.Connection, now: str, temple_id: int) -> None:
+        """在已持有写事务时，按业务时间顺序激活指定寺院所有到点的预约版本。"""
+        due = connection.execute(
+            "SELECT * FROM safety_policy_versions WHERE temple_id=? AND state='scheduled' AND effective_from<=? ORDER BY effective_from,id",
+            (temple_id, now),
+        ).fetchall()
+        for target in due:
+            TempleSafetyService._activate_policy(connection, target)
+
+    @staticmethod
+    def _activate_policy(connection: sqlite3.Connection, target: sqlite3.Row) -> None:
+        """把到点的 scheduled 版本置为唯一 published，并关闭前任的生效区间。
+
+        旧版本区间在 target.effective_from 结束（[start, end) 半开区间，切换
+        这一刻的查询与新建记录全部归新版本），时间线唯一且连续，旧版本永久
+        保留 retired 状态与 retired_at 结束边界以备审计。
+        """
+        boundary = target["effective_from"]
+        connection.execute(
+            "UPDATE safety_policy_versions SET state='retired',retired_at=?,retired_reason='superseded',updated_at=? "
+            "WHERE temple_id=? AND state='published' AND id<>?",
+            (boundary, boundary, target["temple_id"], target["id"]),
+        )
+        connection.execute(
+            "UPDATE safety_policy_versions SET state='published',retired_at=NULL,retired_reason='' WHERE id=?",
+            (target["id"],),
+        )
 
     def add_authorization(self, payload: dict[str, Any]) -> dict[str, Any]:
         temple = self._temple(payload["temple_code"])
@@ -140,14 +231,17 @@ class TempleSafetyService:
             if existing["payload_digest"] != digest:
                 raise ConflictError("相同 observation_key 对应了不同观测内容")
             return self._observation_result(existing["id"])
-        now = to_storage(self.clock.now())
-        safety_policy = self.repository.effective_safety_policy(temple["id"], now)
+        # 先让到达预约时点的版本完成切换，再按观测的业务时间（而非入库时间）
+        # 选取当时有效的策略；迟到的历史观测会命中已退役版本的生效区间。
+        self.activate_due_safety_policies()
+        safety_policy = self.repository.safety_policy_as_of(temple["id"], observed)
         rules = json.loads(safety_policy["rules_json"]) if safety_policy else DEFAULT_RULES
         decision = judge_quality(payload, dict(app), rules)
+        now = to_storage(self.clock.now())
         with transaction(immediate=True) as connection:
             cursor = connection.execute(
-                "INSERT INTO incense_observations(observation_key,temple_id,hall_id,incense_profile_id,steward_hash,sensor_class,visitor_density,pm25_ugm3,co_ppm,supply_airflow,exhaust_airflow,observed_at,received_at,payload_digest) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (payload["observation_key"], temple["id"], hall["id"] if hall else None, app["id"], payload["steward_hash"], payload["sensor_class"], payload["visitor_density"], payload["pm25_ugm3"], payload["co_ppm"], payload["supply_airflow"], payload["exhaust_airflow"], observed, now, digest),
+                "INSERT INTO incense_observations(observation_key,temple_id,hall_id,incense_profile_id,steward_hash,sensor_class,visitor_density,pm25_ugm3,co_ppm,supply_airflow,exhaust_airflow,observed_at,received_at,payload_digest,safety_policy_version_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (payload["observation_key"], temple["id"], hall["id"] if hall else None, app["id"], payload["steward_hash"], payload["sensor_class"], payload["visitor_density"], payload["pm25_ugm3"], payload["co_ppm"], payload["supply_airflow"], payload["exhaust_airflow"], observed, now, digest, safety_policy["id"] if safety_policy else None),
             )
             safety_incident_id = None
             if decision.degraded:
@@ -156,7 +250,13 @@ class TempleSafetyService:
                     (cursor.lastrowid, temple["id"], hall["id"] if hall else None, app["id"], decision.severity, json.dumps(decision.as_dict(), ensure_ascii=False, sort_keys=True), now),
                 )
                 safety_incident_id = safety_incident.lastrowid
-            return {"observation_id": cursor.lastrowid, "safety_incident_id": safety_incident_id, "quality": decision.as_dict()}
+            return {
+                "observation_id": cursor.lastrowid,
+                "safety_incident_id": safety_incident_id,
+                "safety_policy_version_id": safety_policy["id"] if safety_policy else None,
+                "safety_policy_version_no": safety_policy["version_no"] if safety_policy else None,
+                "quality": decision.as_dict(),
+            }
 
     def ingest_batch(self, items: list[dict[str, Any]]) -> dict[str, Any]:
         results = []
@@ -177,10 +277,11 @@ class TempleSafetyService:
         app = self.repository.incense_profile_by_id(safety_incident["incense_profile_id"])
         now_value = self.clock.now()
         now = to_storage(now_value)
+        self.activate_due_safety_policies()
         authorization = self.repository.active_authorization(observation["steward_hash"], safety_incident["temple_id"], now)
         if authorization is None:
             raise ConflictError("用户没有当前寺院的有效缓解权益")
-        safety_policy = self.repository.effective_safety_policy(safety_incident["temple_id"], now)
+        safety_policy = self.repository.active_safety_policy(safety_incident["temple_id"])
         if safety_policy is None:
             raise ConflictError("寺院没有已生效的缓解策略")
         rules = json.loads(safety_policy["rules_json"])

@@ -23,7 +23,7 @@ class TempleRestorationService:
         safety_policy = self.repository.safety_policy_by_id(payload["safety_policy_id"])
         if safety_policy is None or safety_policy["temple_id"] != temple["id"]:
             raise ValidationError("发布策略不属于目标寺院")
-        if safety_policy["state"] not in {"draft", "published"}:
+        if safety_policy["state"] not in {"draft", "scheduled", "published"}:
             raise ConflictError("退役策略不能用于新的发布活动")
         starts_at = self._optional_time(payload.get("starts_at"), "开始时间")
         ends_at = self._optional_time(payload.get("ends_at"), "结束时间")
